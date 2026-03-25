@@ -30,6 +30,10 @@ pub struct FileStats {
     pub group_count: usize,
     pub total_file_count: usize,
     pub total_file_size: FileLen,
+    #[serde(default)]
+    pub shared_file_count: usize,
+    #[serde(default)]
+    pub shared_file_size: FileLen,
     pub redundant_file_count: usize,
     pub redundant_file_size: FileLen,
     pub missing_file_count: usize,
@@ -142,6 +146,12 @@ impl<W: Write> ReportWriter<W> {
                 stats.total_file_count,
                 stats.group_count
             ))?;
+            if stats.shared_file_count > 0 {
+                self.write_header_line(&format!(
+                    "Shared: {} B ({}) in {} files",
+                    stats.shared_file_size.0, stats.shared_file_size, stats.shared_file_count
+                ))?;
+            }
             self.write_header_line(&format!(
                 "Redundant: {} B ({}) in {} files",
                 stats.redundant_file_size.0, stats.redundant_file_size, stats.redundant_file_count
@@ -475,6 +485,10 @@ impl<R: BufRead> TextReportReader<R> {
 
     fn read_extract(&mut self, regex: &Regex, name: &str) -> io::Result<Vec<String>> {
         let line = self.read_line()?;
+        Self::extract_from_line(&line, regex, name)
+    }
+
+    fn extract_from_line(line: &str, regex: &Regex, name: &str) -> io::Result<Vec<String>> {
         Ok(regex
             .captures(line.trim())
             .ok_or_else(|| {
@@ -538,6 +552,8 @@ impl<R: BufRead + Send + 'static> ReportReader for TextReportReader<R> {
             static ref TOTAL_RE: Regex =
                 Regex::new(r"^# Total: ([0-9]+) B \([^)]+\) in ([0-9]+) files in ([0-9]+) groups")
                     .unwrap();
+            static ref SHARED_RE: Regex =
+                Regex::new(r"^# Shared: ([0-9]+) B \([^)]+\) in ([0-9]+) files").unwrap();
             static ref REDUNDANT_RE: Regex =
                 Regex::new(r"^# Redundant: ([0-9]+) B \([^)]+\) in ([0-9]+) files").unwrap();
             static ref MISSING_RE: Regex =
@@ -566,7 +582,20 @@ impl<R: BufRead + Send + 'static> ReportReader for TextReportReader<R> {
         let total_file_count = Self::parse_usize(stats.get(1), "total file count")?;
         let group_count = Self::parse_usize(stats.get(2), "group count")?;
 
-        let stats = self.read_extract(&REDUNDANT_RE, "redundant file statistics")?;
+        // The "Shared" line is optional — try to parse it; if it doesn't match,
+        // the line is the "Redundant" line instead.
+        let next_line = self.read_line()?;
+        let (shared_file_size, shared_file_count, redundant_line) =
+            if let Ok(stats) = Self::extract_from_line(&next_line, &SHARED_RE, "shared") {
+                let size = Self::parse_file_len(stats.first(), "shared file size")?;
+                let count = Self::parse_usize(stats.get(1), "shared file count")?;
+                (size, count, self.read_line()?)
+            } else {
+                (FileLen(0), 0, next_line)
+            };
+
+        let stats =
+            Self::extract_from_line(&redundant_line, &REDUNDANT_RE, "redundant file statistics")?;
         let redundant_file_size = Self::parse_file_len(stats.first(), "redundant file size")?;
         let redundant_file_count = Self::parse_usize(stats.get(1), "redundant file count")?;
 
@@ -583,6 +612,8 @@ impl<R: BufRead + Send + 'static> ReportReader for TextReportReader<R> {
                 group_count,
                 total_file_count,
                 total_file_size,
+                shared_file_count,
+                shared_file_size,
                 redundant_file_count,
                 redundant_file_size,
                 missing_file_count,
@@ -691,6 +722,8 @@ mod test {
                 group_count: 4,
                 total_file_count: 1000,
                 total_file_size: FileLen(2500),
+                shared_file_count: 0,
+                shared_file_size: FileLen(0),
                 redundant_file_count: 234,
                 redundant_file_size: FileLen(1000),
                 missing_file_count: 93,
@@ -935,5 +968,89 @@ mod test {
         let reread_header_2 = roundtrip_header(&header, OutputFormat::Json);
         assert_eq!(header, reread_header_1);
         assert_eq!(header, reread_header_2);
+    }
+
+    #[test]
+    fn test_text_report_shared_stats_roundtrip() {
+        let mut header = dummy_report_header();
+        header.stats.as_mut().unwrap().shared_file_count = 56;
+        header.stats.as_mut().unwrap().shared_file_size = FileLen(1234);
+
+        let reread = roundtrip_header(&header, OutputFormat::Default);
+        assert_eq!(reread.stats.as_ref().unwrap().shared_file_count, 56);
+        assert_eq!(
+            reread.stats.as_ref().unwrap().shared_file_size,
+            FileLen(1234)
+        );
+        assert_eq!(reread, header);
+    }
+
+    #[test]
+    fn test_json_report_shared_stats_roundtrip() {
+        let mut header = dummy_report_header();
+        header.stats.as_mut().unwrap().shared_file_count = 10;
+        header.stats.as_mut().unwrap().shared_file_size = FileLen(5000);
+
+        let reread = roundtrip_header(&header, OutputFormat::Json);
+        assert_eq!(reread.stats.as_ref().unwrap().shared_file_count, 10);
+        assert_eq!(
+            reread.stats.as_ref().unwrap().shared_file_size,
+            FileLen(5000)
+        );
+        assert_eq!(reread, header);
+    }
+
+    #[test]
+    fn test_text_report_reader_handles_missing_shared_line() {
+        // Simulate a report from an older fclones version without the Shared line
+        let mut output = NamedTempFile::new().unwrap();
+        let input = output.reopen().unwrap();
+        writeln!(output, "# Report by fclones 0.34.0").unwrap();
+        writeln!(output, "# Timestamp: 2021-08-27 12:11:23.456 +0000").unwrap();
+        writeln!(output, "# Command: fclones group .").unwrap();
+        writeln!(output, "# Base dir: /tmp").unwrap();
+        writeln!(output, "# Total: 2500 B (2.5 KB) in 1000 files in 4 groups").unwrap();
+        writeln!(output, "# Redundant: 1000 B (1.0 KB) in 234 files").unwrap();
+        writeln!(output, "# Missing: 300 B (300 B) in 93 files").unwrap();
+        drop(output);
+
+        let mut reader = TextReportReader::new(BufReader::new(input));
+        let header = reader.read_header().unwrap();
+        let stats = header.stats.unwrap();
+        assert_eq!(stats.shared_file_count, 0);
+        assert_eq!(stats.shared_file_size, FileLen(0));
+        assert_eq!(stats.redundant_file_count, 234);
+        assert_eq!(stats.redundant_file_size, FileLen(1000));
+        assert_eq!(stats.missing_file_count, 93);
+    }
+
+    #[test]
+    fn test_json_report_reader_handles_missing_shared_fields() {
+        // Simulate a JSON report from an older version without shared fields
+        let json = r#"{
+            "header": {
+                "version": "0.34.0",
+                "timestamp": "2021-08-27T12:11:23.456+00:00",
+                "command": ["fclones", "group", "."],
+                "base_dir": "/tmp",
+                "stats": {
+                    "group_count": 4,
+                    "total_file_count": 1000,
+                    "total_file_size": 2500,
+                    "redundant_file_count": 234,
+                    "redundant_file_size": 1000,
+                    "missing_file_count": 93,
+                    "missing_file_size": 300
+                }
+            },
+            "groups": []
+        }"#;
+
+        let mut reader = JsonReportReader::new(json.as_bytes()).unwrap();
+        let header = reader.read_header().unwrap();
+        let stats = header.stats.unwrap();
+        assert_eq!(stats.shared_file_count, 0);
+        assert_eq!(stats.shared_file_size, FileLen(0));
+        assert_eq!(stats.redundant_file_count, 234);
     }
 }

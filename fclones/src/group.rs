@@ -120,14 +120,17 @@ impl<'a> GroupCtx<'a> {
                 Phase::TransformAndGroup,
             ])
         } else {
-            Phases::new(vec![
-                Phase::Walk,
-                Phase::GroupBySize,
+            let mut p = vec![Phase::Walk, Phase::GroupBySize];
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                p.push(Phase::CollapseReflinks);
+            }
+            p.extend_from_slice(&[
                 Phase::FetchExtents,
                 Phase::GroupByPrefix,
                 Phase::GroupBySuffix,
                 Phase::GroupByContents,
-            ])
+            ]);
+            Phases::new(p)
         };
 
         let thread_pool_sizes = config.thread_pool_sizes();
@@ -865,6 +868,115 @@ fn remove_same_files(
     groups
 }
 
+/// Removes files from a group that share the same physical extents as another file
+/// already in the group (i.e. reflinked files). Returns the number of files removed.
+///
+/// Hardlinked/symlinked files (same FileId) are always preserved — they are already
+/// handled by the existing FileId-based dedup logic. Their extents are still registered
+/// so that reflinks sharing the same physical blocks are properly collapsed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn deduplicate_by_extents(files: &mut Vec<FileInfo>, progress: &dyn Fn(u64)) -> usize {
+    use std::collections::HashSet;
+
+    // Count how many times each FileId appears; >1 means hardlinks/symlinks
+    let mut id_counts: HashMap<FileId, usize> = HashMap::new();
+    for f in files.iter() {
+        *id_counts.entry(f.id).or_default() += 1;
+    }
+
+    let mut seen_extents: HashSet<Vec<(u64, u64)>> = HashSet::new();
+    let mut seen_ids: HashSet<FileId> = HashSet::new();
+    let original_len = files.len();
+    files.retain(|f| {
+        progress(1);
+        let is_hardlink = id_counts.get(&f.id).copied().unwrap_or(0) > 1;
+
+        if is_hardlink {
+            // Register extents for the first occurrence of this inode so that
+            // reflinks sharing the same blocks are caught, but always keep the file.
+            if seen_ids.insert(f.id) {
+                if let Ok(extents) = get_file_extents(&f.path) {
+                    if !extents.is_empty() {
+                        seen_extents.insert(extents);
+                    }
+                }
+            }
+            true
+        } else {
+            match get_file_extents(&f.path) {
+                Ok(extents) if !extents.is_empty() => {
+                    if seen_extents.contains(&extents) {
+                        false // reflink duplicate, drop
+                    } else {
+                        seen_extents.insert(extents);
+                        true
+                    }
+                }
+                _ => true, // on error or empty extents, keep for content hashing
+            }
+        }
+    });
+    original_len - files.len()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn deduplicate_by_extents(_files: &mut Vec<FileInfo>, progress: &dyn Fn(u64)) -> usize {
+    let _ = progress;
+    0
+}
+
+/// Collapses reflinked files within each group by comparing their physical extent maps.
+/// Files sharing the same extents are treated as a single replica.
+/// Returns the groups and the total count/size of collapsed files.
+/// On platforms without extent support, returns groups unchanged with zero shared stats.
+fn collapse_reflinks(
+    ctx: &GroupCtx<'_>,
+    groups: Vec<FileGroup<FileInfo>>,
+) -> (Vec<FileGroup<FileInfo>>, usize, FileLen) {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return (groups, 0, FileLen(0));
+    }
+
+    let file_count = unique_file_count(groups.iter());
+    let progress = ctx.log.progress_bar(
+        &ctx.phases.format(Phase::CollapseReflinks),
+        ProgressBarLength::Items(file_count as u64),
+    );
+
+    let shared_count = std::sync::atomic::AtomicUsize::new(0);
+    let shared_size = std::sync::atomic::AtomicU64::new(0);
+
+    let groups: Vec<_> = groups
+        .into_par_iter()
+        .update(|g| {
+            let file_len = g.file_len;
+            let dropped = deduplicate_by_extents(&mut g.files, &|n| progress.inc(n));
+            if dropped > 0 {
+                shared_count.fetch_add(dropped, Ordering::Relaxed);
+                shared_size.fetch_add(file_len.0.saturating_mul(dropped as u64), Ordering::Relaxed);
+            }
+        })
+        .filter(|g| g.matches(&ctx.group_filter))
+        .collect();
+
+    let sc = shared_count.load(Ordering::Relaxed);
+    let ss = FileLen(shared_size.load(Ordering::Relaxed));
+
+    if sc > 0 {
+        ctx.log.info(format!(
+            "Collapsed {} ({}) already shared (reflinked) files",
+            sc, ss
+        ));
+    }
+
+    let stats = stage_stats(&groups, &ctx.group_filter);
+    ctx.log.info(format!(
+        "Found {} ({}) candidates after collapsing reflinks",
+        stats.0, stats.1
+    ));
+    (groups, sc, ss)
+}
+
 #[cfg(target_os = "linux")]
 fn atomic_counter_vec(len: usize) -> Vec<std::sync::atomic::AtomicU32> {
     let mut v = Vec::with_capacity(len);
@@ -1153,6 +1265,26 @@ fn group_by_contents(
     groups
 }
 
+/// Result of grouping files, containing the groups and statistics about shared files.
+///
+/// Derefs to `Vec<FileGroup<FileInfo>>` so callers that only need the groups
+/// can use it transparently (indexing, `.len()`, `.iter()`, etc.).
+pub struct GroupResult {
+    /// Groups of duplicate files
+    pub groups: Vec<FileGroup<FileInfo>>,
+    /// Number of files collapsed because they share physical extents (reflinks)
+    pub shared_file_count: usize,
+    /// Total size of files collapsed because they share physical extents
+    pub shared_file_size: FileLen,
+}
+
+impl std::ops::Deref for GroupResult {
+    type Target = Vec<FileGroup<FileInfo>>;
+    fn deref(&self) -> &Self::Target {
+        &self.groups
+    }
+}
+
 /// Groups identical files together by 128-bit hash of their contents.
 /// Depending on filtering settings, can find unique, duplicate, over- or under-replicated files.
 ///
@@ -1162,9 +1294,8 @@ fn group_by_contents(
 /// subdirectories recursively (default is false).
 ///
 /// # Output
-/// Returns a vector of groups of absolute paths.
-/// Each group of files has a common hash and length.
-/// Groups are sorted descending by file size.
+/// Returns a [`GroupResult`] containing groups of files with common hash and length,
+/// sorted descending by file size, along with statistics about collapsed reflinks.
 ///
 /// # Errors
 /// An error is returned immediately if the configuration is invalid.
@@ -1197,9 +1328,10 @@ fn group_by_contents(
 /// 2. Get length and identifier of each file.
 /// 3. Group files by length.
 /// 4. In each group, remove duplicate files with the same identifier.
-/// 5. Group files by hash of the prefix.
-/// 6. Group files by hash of the suffix.
-/// 7. Group files by hash of their full contents.
+/// 5. Collapse reflinked files sharing the same physical extents.
+/// 6. Group files by hash of the prefix.
+/// 7. Group files by hash of the suffix.
+/// 8. Group files by hash of their full contents.
 ///
 /// # Example
 /// ```
@@ -1212,29 +1344,31 @@ fn group_by_contents(
 /// let mut config = GroupConfig::default();
 /// config.paths = vec![Path::from("/path/to/a/dir")];
 ///
-/// let groups = group_files(&config, &log).unwrap();
-/// println!("Found {} groups: ", groups.len());
+/// let result = group_files(&config, &log).unwrap();
+/// println!("Found {} groups: ", result.len());
 ///
 /// // print standard fclones report to stdout:
-/// write_report(&config, &log, &groups).unwrap();
+/// write_report(&config, &log, &result).unwrap();
 /// ```
-pub fn group_files(config: &GroupConfig, log: &dyn Log) -> Result<Vec<FileGroup<FileInfo>>, Error> {
+pub fn group_files(config: &GroupConfig, log: &dyn Log) -> Result<GroupResult, Error> {
     let spinner = log.progress_bar("Initializing", ProgressBarLength::Unknown);
     let ctx = GroupCtx::new(config, log)?;
 
     drop(spinner);
     let matching_files = scan_files(&ctx);
 
-    let mut groups = match &ctx.hasher.transform {
+    let (mut groups, shared_file_count, shared_file_size) = match &ctx.hasher.transform {
         Some(_transform) => {
             let mut files = matching_files.into_iter().flatten().collect_vec();
             deduplicate(&mut files, |_| {});
             update_file_locations(&ctx, &mut files);
-            group_transformed(&ctx, files)
+            (group_transformed(&ctx, files), 0, FileLen(0))
         }
         _ => {
             let size_groups = group_by_size(&ctx, matching_files);
-            let mut size_groups_pruned = remove_same_files(&ctx, size_groups);
+            let size_groups_pruned = remove_same_files(&ctx, size_groups);
+            let (mut size_groups_pruned, shared_count, shared_size) =
+                collapse_reflinks(&ctx, size_groups_pruned);
             update_file_locations(&ctx, &mut size_groups_pruned);
             let prefix_len = ctx
                 .config
@@ -1242,18 +1376,23 @@ pub fn group_files(config: &GroupConfig, log: &dyn Log) -> Result<Vec<FileGroup<
                 .unwrap_or_else(|| prefix_len(&ctx.devices, flat_iter(&size_groups_pruned)));
             let prefix_groups = group_by_prefix(&ctx, prefix_len, size_groups_pruned);
             let suffix_groups = group_by_suffix(&ctx, prefix_groups);
-            if !ctx.config.skip_content_hash {
+            let groups = if !ctx.config.skip_content_hash {
                 group_by_contents(&ctx, prefix_len, suffix_groups)
             } else {
                 suffix_groups
-            }
+            };
+            (groups, shared_count, shared_size)
         }
     };
     groups.par_sort_by_key(|g| Reverse((g.file_len, g.file_hash.u128_prefix())));
     groups
         .par_iter_mut()
         .for_each(|g| g.sort_by_path(&ctx.group_filter.root_paths));
-    Ok(groups)
+    Ok(GroupResult {
+        groups,
+        shared_file_count,
+        shared_file_size,
+    })
 }
 
 /// Writes the list of groups to a file or the standard output.
@@ -1266,12 +1405,9 @@ pub fn group_files(config: &GroupConfig, log: &dyn Log) -> Result<Vec<FileGroup<
 ///
 /// # Errors
 /// Returns [`io::Error`] on I/O write error or if the output file cannot be created.
-pub fn write_report(
-    config: &GroupConfig,
-    log: &dyn Log,
-    groups: &[FileGroup<FileInfo>],
-) -> io::Result<()> {
+pub fn write_report(config: &GroupConfig, log: &dyn Log, result: &GroupResult) -> io::Result<()> {
     let now = Local::now();
+    let groups = &result.groups;
 
     let total_count = file_count(groups.iter());
     let total_size = total_size(groups.iter());
@@ -1294,6 +1430,8 @@ pub fn write_report(
             group_count: groups.len(),
             total_file_count: total_count,
             total_file_size: total_size,
+            shared_file_count: result.shared_file_count,
+            shared_file_size: result.shared_file_size,
             redundant_file_count: redundant_count,
             redundant_file_size: redundant_size,
             missing_file_count: missing_count,
