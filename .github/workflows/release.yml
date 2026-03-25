@@ -1,0 +1,23 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-macos:
+    runs-on: macos-14          # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          tar czf "fclones-${TAG}-darwin-arm64.tar.gz" -C target/release fclones
+          shasum -a 256 "fclones-${TAG}-darwin-arm64.tar.gz" > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fclones-*-darwin-arm64.tar.gz
+            checksums.txt
+          generate_release_notes: true
